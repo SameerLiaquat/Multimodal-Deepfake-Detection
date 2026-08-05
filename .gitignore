@@ -1,0 +1,30 @@
+# Feature caches
+feature_cache/
+
+# Trained models
+fusion_weights/
+
+# Outputs
+outputs/
+
+# Temporary files
+tmp/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Model weights
+*.pth
+*.pt
+*.ckpt
+
+# Datasets
+datasets/
+config/datasets/
+
+# Training runs
+runs/
+
+# Downloaded model weights
+weights/
