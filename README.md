@@ -1,170 +1,212 @@
-# Deepfake Detection that Generalizes Across Benchmarks (WACV 2026)
+# Cross-Attention Fusion of Blend-Boundary and Semantic Detectors for Deepfakes
 
-[![arXiv Badge](https://img.shields.io/badge/arXiv-B31B1B?logo=arxiv&logoColor=FFF)](https://arxiv.org/abs/2508.06248)
-[![Hugging Face Badge](https://img.shields.io/badge/Hugging%20Face-FFD21E?logo=huggingface&logoColor=000)](https://huggingface.co/collections/yermandy/gend)
+![Python](https://img.shields.io/badge/python-3.12-blue)
+![PyTorch](https://img.shields.io/badge/PyTorch-DL_framework-orange)
+![Status](https://img.shields.io/badge/status-active_research-brightgreen)
 
-This is the official repository for the paper:
+> Investigates whether fusing a spatial blend-boundary detector (Face X-Ray) with a semantic foundation-model detector (GenD, DINOv3-based) via a trainable cross-attention mechanism improves deepfake detection beyond either model alone — with both pretrained backbones kept fully frozen.
 
-**[Deepfake Detection that Generalizes Across Benchmarks](https://arxiv.org/abs/2508.06248)**.
+**Headline result:** the fusion model beat GenD alone in **5/5 independent training runs** on FaceForensics++ (97.241% ± 0.040% vs. 96.648% AUC), and the same margin held up on an **independent cross-dataset benchmark** (Celeb-DF v2, 92.835% vs. 92.275% video-level AUC) with no retraining — evidence the improvement generalizes rather than being an artifact of one dataset.
 
-### Abstract
+---
 
-> The generalization of deepfake detectors to unseen manipulation techniques remains a challenge for practical deployment. Although many approaches adapt foundation models by introducing significant architectural complexity, this work demonstrates that robust generalization is achievable through a parameter-efficient adaptation of one of the foundational pre-trained vision encoders. The proposed method, GenD, fine-tunes only the Layer Normalization parameters (0.03% of the total) and enhances generalization by enforcing a hyperspherical feature manifold using L2 normalization and metric learning on it.
->
-> We conducted an extensive evaluation on 14 benchmark datasets spanning from 2019 to 2025. The proposed method achieves state-of-the-art performance, outperforming more complex, recent approaches in average cross-dataset AUROC. Our analysis yields two primary findings for the field: 1) training on paired real-fake data from the same source video is essential for mitigating shortcut learning and improving generalization, and 2) detection difficulty on academic datasets has not strictly increased over time, with models trained on older, diverse datasets showing strong generalization capabilities.
->
-> This work delivers a computationally efficient and reproducible method, proving that state-of-the-art generalization is attainable by making targeted, minimal changes to a pre-trained foundational image encoder model.
+## Table of Contents
 
-## Inference using Hugging Face transformers
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Key Technical Challenges & Fixes](#key-technical-challenges--fixes)
+- [Results](#results)
+- [Repository Structure](#repository-structure)
+- [Setup & Installation](#setup--installation)
+- [Usage](#usage)
+- [Methodology](#methodology)
+- [Key Findings](#key-findings)
+- [Limitations & Future Work](#limitations--future-work)
 
-This example shows how to run inference with the pretrained GenD model from Hugging Face without other dependencies except `torch` and `transformers`. It expects that input images are already preprocessed by detector.
+---
 
-### Minimal dependencies
+## Overview
 
-``` bash
-conda create --name GenD python=3.12 uv -y
-conda activate GenD
-uv pip install torch==2.8.0 torchvision==0.23.0 transformers==4.56.2
+Existing deepfake detectors tend to specialise in one of two directions: spatial-artifact detectors (e.g. Face X-Ray) that find the blend boundary left by face-swap manipulation, or semantic foundation-model detectors (e.g. GenD) that form a holistic judgement from a large pretrained vision transformer. This project fuses both, and validates the result both in-distribution and cross-dataset.
+
+**Aim:** to investigate whether fusing Face X-Ray with GenD via a trainable cross-attention mechanism, with both pretrained backbones kept frozen, improves deepfake detection accuracy beyond either model alone.
+
+---
+
+## Architecture
+
+```
+Face X-Ray patches (4096 × 18)         GenD CLS token (1 × 1024)
+        │                                       │
+        ▼                                       ▼
+ Patch projection                       Query projection
+ Linear 18→512, L2 norm                 Linear 1024→512, L2 norm
+        │                                       │
+        └───────────────┬───────────────────────┘
+                         ▼
+              Cross-attention (8 heads)
+        Query = GenD  ·  Key/Value = Face X-Ray patches
+                         │
+                         ▼
+              Residual + LayerNorm
+              (512-dim fused representation)
+                         │
+                         ▼
+                    Classifier
+        Linear 512→128 → ReLU → Dropout → Linear 128→2
+                         │
+                         ▼
+                Real / Fake prediction
 ```
 
-### Inference with transformers
+Both backbones (HRNet-W18 for Face X-Ray, DINOv3 ViT-L for GenD) are kept fully frozen throughout — only the fusion head (~1.65M parameters) is trained, isolating the fusion mechanism's contribution from any backbone fine-tuning effect.
 
-``` python
-import requests
-import torch
-from PIL import Image
+---
 
-from src.hf.modeling_gend import GenD
+## Key Technical Challenges & Fixes
 
-# Other models can be found in https://huggingface.co/collections/yermandy/gend
-# - yermandy/GenD_CLIP_L_14
-# - yermandy/GenD_PE_L
-# - yermandy/GenD_DINOv3_L
-model = GenD.from_pretrained("yermandy/GenD_CLIP_L_14")
+Two significant preprocessing bugs were found and fixed through systematic diagnostic testing before any architectural conclusions were drawn — together they accounted for far more of the initial performance gap than any modelling choice.
 
-urls = [
-    "https://github.com/yermandy/deepfake-detection/blob/main/datasets/FF/DF/000_003/000.png?raw=true",
-    "https://github.com/yermandy/deepfake-detection/blob/main/datasets/FF/real/000/000.png?raw=true",
-]
-images = [Image.open(requests.get(url, stream=True).raw) for url in urls]
-tensors = torch.stack([model.feature_extractor.preprocess(img) for img in images])
-logits = model(tensors)
-probs = logits.softmax(dim=-1)
+| Bug | Root cause | Fix | Impact |
+|---|---|---|---|
+| **Face X-Ray backbone never loading** | A checkpoint key-prefix mismatch silently discarded ~1954 of ~1958 pretrained weight tensors on load | Removed the erroneous prefix-stripping step; verified via missing/unexpected key counts | Standalone AUC: 52.1% → 87% |
+| **Missing face-crop preprocessing** | Both models were receiving full, uncropped video frames instead of the tightly-cropped faces they were trained on | Added a face-detection + crop step (1.3× margin) before each model's own preprocessing | GenD standalone AUC: 78.5% → 96.1% (frame-level) |
 
-print(probs)
+---
+
+## Results
+
+### Final validated comparison (FaceForensics++, in-distribution)
+
+| Configuration | Mechanism | AUC |
+|---|---|---|
+| Face X-Ray alone | real mask + classifier pipeline | ~87% |
+| GenD alone | real trained classifier, exact-match val set | 96.648% |
+| Fusion — gated cross-attention | trainable GenD-only fallback | 97.074% |
+| Fusion — gated, real GenD fallback | frozen real classifier, gate bias −2.0 | 97.025% |
+| Fusion — gated, real GenD fallback | frozen real classifier, gate bias 0.0 | 96.944% |
+| **Fusion — no gate (winning architecture)** | **always 100% fused branch** | **97.221%** (single run) |
+
+### Multi-seed robustness validation
+
+Same architecture, 5 independent training runs from different random seeds, identical data:
+
+| Seed | AUC | Beats GenD alone (96.648%)? |
+|---|---|---|
+| 0 | 97.241% | Yes |
+| 1 | 97.187% | Yes |
+| 2 | 97.215% | Yes |
+| 3 | 97.256% | Yes |
+| 4 | 97.305% | Yes |
+
+**Mean: 97.241% ± 0.040%** — 5/5 seeds beat GenD alone, by a margin roughly 15× larger than the run-to-run variation of the method itself.
+
+### Cross-dataset generalization (Celeb-DF v2, official 518-video test split, no retraining)
+
+| Model | Frame-level AUC | Video-level AUC |
+|---|---|---|
+| Face X-Ray alone | 66.897% | 76.664% |
+| GenD alone | 83.482% | 92.275% |
+| **Fusion (5-seed ensemble)** | **84.408%** | **92.835%** |
+
+The re-measured GenD-alone figure (92.275%) matches GenD's own published Celeb-DF v2 result (92.2%, DINO variant) to within 0.08 points — independent confirmation the extraction pipeline is faithful to the standard protocol.
+
+---
+
+## Repository Structure
+
+### Final pipeline
+| File | Purpose |
+|---|---|
+| `fusion_crossattn_gated_v3.py` | Fully corrected pipeline, gated architecture, feature caching |
+| `fusion_no_gate_pure.py` | Winning architecture — no-gate cross-attention fusion |
+| `fusion_multiseed_validation.py` | Trains the winning architecture across 5 seeds |
+| `evaluate_celebdf.py` | Cross-dataset evaluation on Celeb-DF v2 |
+
+### Diagnostics
+| File | Purpose |
+|---|---|
+| `inspect_facexray_checkpoint.py` | Raw checkpoint inspection |
+| `verify_facexray_real_pipeline.py` | A/B tests for loading, normalization, face-cropping |
+| `inspect_and_verify_gend.py` | GenD model structure inspection |
+| `verify_gend_facecrop.py` | A/B test confirming GenD required face-cropped input |
+| `compare_gend_vs_fusion_exact_match.py` | Exact-match GenD-alone baseline |
+
+### Architecture experiments / ablations
+| File | Purpose |
+|---|---|
+| `fusion_crossattn_gated.py` | First gated fusion implementation (pre-fix) |
+| `fusion_crossattn_gated_v2.py` | Gated fusion with the Face X-Ray fix applied |
+| `fusion_experiments_v3.py` | Regularization and residual-correction fusion comparison |
+| `fusion_real_gend_fallback.py` | Tests replacing the trained-from-scratch fallback with GenD's real classifier |
+| `fusion_improvements.py` | Reusable fusion-variant building blocks |
+
+---
+
+## Setup & Installation
+
+```bash
+git clone https://github.com/[your-username]/[repo-name].git
+cd [repo-name]
+
+conda create -n fusion python=3.12
+conda activate fusion
+pip install torch torchvision opencv-python pillow scikit-learn tqdm numpy transformers
+
+hf auth login
 ```
 
-## Inference using Gradio UI
+Pretrained weights required:
+- Face X-Ray: HRNet-W18 checkpoint (`best_model.pth.tar`)
+- GenD: `yermandy/GenD_DINOv3_L` (auto-downloaded from Hugging Face)
 
-We provide a Gradio-based web UI for inference, install all dependencies as described in the [Training](#training) section, then run:
+Datasets: [FaceForensics++](https://github.com/ondyari/FaceForensics) (c23), [Celeb-DF v2](https://github.com/yuezunli/celeb-deepfakeforensics) (official request form required)
 
-``` bash
-python app/run.py
+---
+
+## Usage
+
+```bash
+# Fully corrected pipeline: extracts + caches features, trains, evaluates
+python fusion_crossattn_gated_v3.py --epochs 30
+
+# Winning architecture across 5 seeds (reuses cached features)
+python fusion_multiseed_validation.py
+
+# Cross-dataset evaluation, no retraining
+python evaluate_celebdf.py
 ```
 
-![gradio-demo-app](media/gradio.png)
+---
 
-## Training
+## Methodology
 
-### Datasets
+Experimental deep learning research methodology, iterative development across five phases:
 
-To facilitate reproducibility, preprocessed training, validation, and test datasets were uploaded to [Hugging Face](https://huggingface.co/datasets/yermandy/GenD).
+1. **Data Pipeline** — preprocess deepfake datasets, clean/normalise, split train/val/test.
+2. **Baseline** — reproduce and validate the original baseline framework.
+3. **Model Integration** — implement the GenD encoder and Face X-Ray blend-boundary detector; design the cross-attention fusion module.
+4. **Training & Evaluation** — train in PyTorch; evaluate via AUROC, F1-score, and accuracy; test cross-dataset generalisation.
+5. **Failure Analysis & Manuscript** — apply Grad-CAM/saliency maps to diagnose failure modes, refine accordingly, write up findings.
 
-### Set up environment
+**Best practice:** version control, experiment tracking, modular documented code, reproducible training configs, regular supervisor reviews.
 
-``` bash
-conda create --name GenD python=3.12 uv -y
-conda activate GenD
-uv pip install -r requirements.txt
-```
+---
 
-### Minimal example without external data
+## Key Findings
 
-#### Training example
+1. **A strong fallback removes the pressure to fuse.** With a genuinely strong fallback branch, the model relied on it almost exclusively (~17% trust in the fused branch) and performance regressed toward GenD-alone. With a weaker fallback, the model was forced to genuinely engage with the fused signal (~80% trust) and outperformed GenD alone. Fusion's benefit is conditional on the model needing it, not automatic.
+2. **The simplest design won.** Removing the gate entirely — always fully committing to the fused representation — beat every gated variant tested, with fewer trainable parameters.
+3. **Preprocessing bugs explained more of the early performance gap than any architecture choice.**
+4. **The improvement generalizes.** The same-sized margin over GenD alone held up on an independent, cross-dataset benchmark with no retraining.
 
-Examine `src/exp/examples.py`, each experiment name is defined as a key, a value overrides default configuration of `Config` object from `src/config.py`. For example, try to run `example-training` experiment:
+---
 
-``` bash
-python run_exp.py example-training
-```
+## Limitations & Future Work
 
-#### Test example after the model is trained
-
-``` bash
-python run_exp.py example-test --from_exp example-training --test
-```
-
-Alternatively, you can try inference using one of our released models from Hugging Face:
-
-``` bash
-python run_exp.py GenD_CLIP--CDFv2-example --test
-python run_exp.py GenD_PE--CDFv2-example --test
-python run_exp.py GenD_DINO--CDFv2-example --test
-```
-
-### Full training
-
-To fully train the model, you need to download datasets, preprocess them, and create files with paths to the images.
-
-The training entry will be similar to the minimal example above.
-
-All experiments (configs) from the paper are stored in the `src/exp` folder.
-
-#### Prepare the dataset
-
-Take for example [FaceForensics++](https://github.com/ondyari/FaceForensics) dataset, follow these steps:
-
-1. Download the dataset first from the [official source](https://github.com/ondyari/FaceForensics). The root of this dataset is `./FaceForensics`
-
-2. Preprocess the dataset using `detector.py` script:
-
-``` bash
-python detector.py -i FaceForensics/manipulated_sequences/Deepfakes/c23/videos/ --mask_folder FaceForensics/masks/manipulated_sequences/Deepfakes/masks/videos/ -m at_least -n 32 -o datasets/FF/DF/ --det_thres 0.1 -s 1.3 --target_size none
-```
-
-Repeat the process for other manipulation methods and real videos. After processing everything, you will get a similar structure:
-
-``` bash
-datasets
-└── FF
-    ├── DF
-    │   └── 000_003
-    │       ├── 025.png
-    │       └── 038.png
-    ├── F2F
-    │   └── 000_003
-    │       ├── 019.png
-    │       └── 029.png
-    ├── FS
-    │   └── 000_003
-    │       ├── 019.png
-    │       └── 029.png
-    ├── NT
-    │   └── 000_003
-    │       ├── 019.png
-    │       └── 029.png
-    └── real
-        └── 000
-            ├── 025.png
-            └── 038.png
-```
-
-3. Create files with paths to images similar to the ones in `config/datasets` directory. It can be done using:
-
-``` bash
-find datasets/FF/DF/* -type f | sort > config/datasets/FF/DF.txt
-```
-
-We manage links to files using `src/utils/files.py`.
-
-### Cite
-
-``` bibtex
-@inproceedings{GenD,
-    title        = {Deepfake detection that generalizes across benchmarks},
-    author       = {Yermakov, Andrii and Cech, Jan and Matas, Jiri and Fritz, Mario},
-    year         = 2026,
-    booktitle    = {Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision},
-    pages        = {773--783}
-}
-```
+- Cross-dataset testing is partial — only Celeb-DF v2 has been tested; DFDC has not yet been run.
+- F1-score has not been computed — evaluation so far uses AUROC and accuracy only.
+- No failure/interpretability analysis yet — Grad-CAM/saliency-map diagnosis has not been started.
+- Baseline reproduction (Phase 2) scope needs confirming against the original methodology.
+- The FF++ official held-out test split has not been used.
+- Full architecture ablation table on the fully-corrected feature pipeline is in progress.
