@@ -176,37 +176,3 @@ python fusion_multiseed_validation.py
 # Cross-dataset evaluation, no retraining
 python evaluate_celebdf.py
 ```
-
----
-
-## Methodology
-
-Experimental deep learning research methodology, iterative development across five phases:
-
-1. **Data Pipeline** — preprocess deepfake datasets, clean/normalise, split train/val/test.
-2. **Baseline** — reproduce and validate the original baseline framework.
-3. **Model Integration** — implement the GenD encoder and Face X-Ray blend-boundary detector; design the cross-attention fusion module.
-4. **Training & Evaluation** — train in PyTorch; evaluate via AUROC, F1-score, and accuracy; test cross-dataset generalisation.
-5. **Failure Analysis & Manuscript** — apply Grad-CAM/saliency maps to diagnose failure modes, refine accordingly, write up findings.
-
-**Best practice:** version control, experiment tracking, modular documented code, reproducible training configs, regular supervisor reviews.
-
----
-
-## Key Findings
-
-1. **A strong fallback removes the pressure to fuse.** With a genuinely strong fallback branch, the model relied on it almost exclusively (~17% trust in the fused branch) and performance regressed toward GenD-alone. With a weaker fallback, the model was forced to genuinely engage with the fused signal (~80% trust) and outperformed GenD alone. Fusion's benefit is conditional on the model needing it, not automatic.
-2. **The simplest design won.** Removing the gate entirely — always fully committing to the fused representation — beat every gated variant tested, with fewer trainable parameters.
-3. **Preprocessing bugs explained more of the early performance gap than any architecture choice.**
-4. **The improvement generalizes.** The same-sized margin over GenD alone held up on an independent, cross-dataset benchmark with no retraining.
-
----
-
-## Limitations & Future Work
-
-- Cross-dataset testing is partial — only Celeb-DF v2 has been tested; DFDC has not yet been run.
-- F1-score has not been computed — evaluation so far uses AUROC and accuracy only.
-- No failure/interpretability analysis yet — Grad-CAM/saliency-map diagnosis has not been started.
-- Baseline reproduction (Phase 2) scope needs confirming against the original methodology.
-- The FF++ official held-out test split has not been used.
-- Full architecture ablation table on the fully-corrected feature pipeline is in progress.
